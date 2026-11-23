@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# issue-md — dump a GitHub issue (or PR) and every comment stream into one markdown file.
+#
+# usage: issue-md OWNER/REPO NUMBER [-o DIR] [--deep]
+#   -o DIR   output directory (default: ./.gh-issues in the current directory)
+#   --deep   also fetch the full timeline for cross-references (costs several requests)
+#   auth:    set GITHUB_TOKEN (or GH_TOKEN) for private repos + 5000 req/hr.
+#
+# Sections written:
+#   ## C<n>  conversation comments
+#   ## R<n>  review verdicts           (PR only)
+#   ## I<n>  inline review comments    (PR only, with file:line + diff context)
+#   ## H<n>  history: labels, assignment, close/reopen, references, deleted comments
+#   ## X<n>  cross-references          (--deep only)
+#
+# Re-running is cheap: requests are conditional (ETag), so unchanged pages come back
+# 304 with no body to download or parse. Caveat: unauthenticated 304s still consume
+# quota (measured); the bandwidth saving is real either way.
+set -euo pipefail
+
+MAX_PAGES=200
+
+usage() {
+  cat >&2 <<'EOF'
+usage: issue-md OWNER/REPO NUMBER [-o DIR] [--deep]
+  -o DIR   output directory (default: ./.gh-issues)
+  --deep   also fetch the timeline for cross-references
+  auth:    set GITHUB_TOKEN (or GH_TOKEN) for private repos and a 5000 req/hr limit
+EOF
+}
+
+command -v jq >/dev/null 2>&1 || { echo "issue-md: jq is required (install jq first)" >&2; exit 1; }
+
+deep=0 outdir="" pos=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --deep) deep=1; shift ;;
+    -o|--out) outdir=${2:?-o needs a directory}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "issue-md: unknown option $1" >&2; usage; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+repo=${pos[0]:-} num=${pos[1]:-}
+[ -n "$repo" ] && [ -n "$num" ] || { usage; exit 2; }
+num=${num#\#}
+[ -n "$outdir" ] || outdir=${pos[2]:-.gh-issues}
+
+token=${GITHUB_TOKEN:-${GH_TOKEN:-}}
+auth=()
+[ -n "$token" ] && auth=(-H "Authorization: Bearer $token")
+
+# mode is applied at creation only, so an existing directory (including ".") is never altered
+mkdir -m 700 -p "$outdir"
+tmp=$(mktemp -d "$outdir/.issue-md.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+req=0 cached=0 remaining="?"
+
+# fetch_json URL DEST ETAGFILE — conditional GET; keeps DEST when the server says 304
+fetch_json() {
+  local url=$1 dest=$2 etagf=$3 code hdr=() r
+  req=$((req + 1))
+  if [ -s "$etagf" ] && [ -s "$dest" ]; then
+    hdr=(-H "If-None-Match: $(cat "$etagf")")
+  fi
+  if ! code=$(curl -sSL --compressed -m 90 -D "$tmp/hdr" -o "$tmp/resp" -w '%{http_code}' \
+      "${auth[@]}" -H "Accept: application/vnd.github+json" "${hdr[@]}" "$url"); then
+    echo "issue-md: network error fetching $url" >&2
+    return 1
+  fi
+  case $code in
+    200)
+      mv "$tmp/resp" "$dest"
+      sed -n 's/^[Ee][Tt]ag: *//p' "$tmp/hdr" | tr -d '\r' >"$etagf"
+      ;;
+    304) cached=$((cached + 1)) ;;
+    2*)  mv "$tmp/resp" "$dest" ;;
+    *)
+      echo "issue-md: HTTP $code from $url: $(jq -r '.message? // .' <"$tmp/resp" 2>/dev/null | head -3)" >&2
+      if jq -e '(.message? // "") | test("rate limit"; "i")' <"$tmp/resp" >/dev/null 2>&1; then
+        echo "issue-md: rate limited — wait for the reset, or export GITHUB_TOKEN" >&2
+      fi
+      return 1
+      ;;
+  esac
+  r=$(sed -n 's/^[Xx]-[Rr]ate[Ll]imit-[Rr]emaining: *\([0-9]*\).*/\1/p' "$tmp/hdr" | tr -d '\r' | tail -1)
+  [ -n "$r" ] && remaining=$r
+  return 0
+}
+
+# paginate STREAM BASE_URL OUTJSONL — pages are cached individually, so growth only
+# costs the pages that actually changed.
+paginate() {
+  local stream=$1 url=$2 out=$3 page last
+  local cdir="$cache/$stream"
+  mkdir -p "$cdir"
+  fetch_json "$url?per_page=100&page=1" "$cdir/1.json" "$cdir/1.etag"
+  last=$(sed -n 's/.*[?&]page=\([0-9][0-9]*\)>; rel="last".*/\1/p' "$tmp/hdr" | tail -1)
+  if [ -z "$last" ]; then
+    # a 304 may omit Link; fall back to the page count from the last successful run
+    last=$(cat "$cdir/last" 2>/dev/null || echo 1)
+  fi
+  if [ "$last" -gt "$MAX_PAGES" ]; then
+    echo "issue-md: WARNING: $stream exceeds $MAX_PAGES pages; output is TRUNCATED" >&2
+    last=$MAX_PAGES
+  fi
+  printf '%s\n' "$last" >"$cdir/last"
+  : >"$out"
+  page=1
+  while [ "$page" -le "$last" ]; do
+    if [ "$page" -gt 1 ]; then
+      fetch_json "$url?per_page=100&page=$page" "$cdir/$page.json" "$cdir/$page.etag"
+    fi
+    [ -s "$cdir/$page.json" ] && jq -c '.[]' "$cdir/$page.json" >>"$out"
+    page=$((page + 1))
+  done
+}
+
+base="https://api.github.com/repos/$repo/issues/$num"
+
+fetch_json "$base" "$tmp/issue.json" "$tmp/issue.etag"
+is_pr=$(jq -r '.pull_request != null' "$tmp/issue.json")
+canon=$(jq -r '.repository_url | sub("https://api.github.com/repos/"; "")' "$tmp/issue.json")
+slug=$(printf '%s' "$canon" | tr '/' '-')
+out="$outdir/$slug-$num.md"
+cache="$outdir/.cache/$slug-$num"
+
+conv="$tmp/conversation.jsonl" revs="$tmp/reviews.jsonl" inl="$tmp/inline.jsonl"
+hist="$tmp/history.jsonl" links="$tmp/links.jsonl"
+: >"$conv"; : >"$revs"; : >"$inl"; : >"$hist"; : >"$links"
+
+paginate conversation "$base/comments" "$conv"
+paginate history "$base/events" "$hist"
+if [ "$is_pr" = true ]; then
+  proot="https://api.github.com/repos/$repo/pulls/$num"
+  paginate reviews "$proot/reviews" "$revs"
+  paginate inline "$proot/comments" "$inl"
+fi
+if [ "$deep" = 1 ]; then
+  paginate timeline "$base/timeline" "$tmp/timeline.jsonl"
+  # /events does not report cross-references; the timeline does
+  jq -c 'select(.event == "cross-referenced")' "$tmp/timeline.jsonl" >"$links"
+fi
+
+{
+  jq -r '
+    "# \(.title)\n\n" +
+    "- \(.html_url)\n" +
+    "- type: \(if .pull_request then "pull request" else "issue" end)\n" +
+    "- state: \(.state)\(if .state_reason then " (\(.state_reason))" else "" end)\n" +
+    "- opened: \(.created_at) by @\(.user.login)\n" +
+    (if .closed_at then "- closed: \(.closed_at)\(if .closed_by then " by @\(.closed_by.login)" else "" end)\n" else "" end) +
+    "- labels: \(if (.labels | length) == 0 then "none" else ([.labels[].name] | join(", ")) end)\n" +
+    "- comments: \(.comments)\n"
+  ' "$tmp/issue.json"
+
+  # orientation block: read this instead of grepping for the index first
+  jq -n \
+    --argjson conv "$(wc -l <"$conv" | tr -d ' ')" \
+    --argjson revs "$(wc -l <"$revs" | tr -d ' ')" \
+    --argjson inl  "$(wc -l <"$inl"  | tr -d ' ')" \
+    --argjson hist "$(wc -l <"$hist" | tr -d ' ')" \
+    --argjson xrefs "$(wc -l <"$links" | tr -d ' ')" \
+    --arg top "$(jq -rs 'group_by(.user.login) | map([.[0].user.login, length])
+                     | sort_by(-.[1])[:5] | map("\(.[0]) (\(.[1]))") | join(", ")' "$conv")" \
+    --arg range "$(jq -rs '[.[].created_at] | "\(min // "-") … \(max // "-")"' "$conv")" \
+    -r '"- thread: \($conv) conversation, \($revs) reviews, \($inl) inline, \($hist) history" +
+        (if $xrefs > 0 then ", \($xrefs) cross-references" else "" end) + "\n" +
+        "- span: \($range)\n" +
+        (if $top == "" then "" else "- most active: \($top)\n" end)'
+
+  jq -r '"\n---\n\n\(.body // "_(no body)_")\n"' "$tmp/issue.json"
+
+  if [ -s "$conv" ]; then
+    jq -rs 'to_entries[] |
+      "\n---\n\n## C\(.key + 1) · @\(.value.user.login) · \(.value.created_at)\n\n" +
+      "^(\(.value.html_url))^\n\n\(.value.body // "_(empty)_")\n"' "$conv"
+  fi
+  if [ -s "$revs" ]; then
+    jq -rs 'to_entries[] |
+      "\n---\n\n## R\(.key + 1) · @\(.value.user.login) · \(.value.state) · \(.value.submitted_at // "-")\n\n" +
+      "^(\(.value.html_url))^\n\n\(.value.body // "_(no summary)_")\n"' "$revs"
+  fi
+  if [ -s "$inl" ]; then
+    jq -rs '(sort_by(.path, (.line // .original_line // 0)) | to_entries[]) |
+      "\n---\n\n## I\(.key + 1) · @\(.value.user.login) · \(.value.path):\(.value.line // .value.original_line // "?")" +
+      " · \(.value.created_at)\(if .value.in_reply_to_id then " · reply" else "" end)\n\n" +
+      "^(\(.value.html_url))^\n\n" +
+      (if .value.diff_hunk then "```diff\n\(.value.diff_hunk | split("\n") | .[-6:] | join("\n"))\n```\n\n" else "" end) +
+      "\(.value.body // "_(empty)_")\n"' "$inl"
+  fi
+  if [ -s "$hist" ]; then
+    jq -rs '
+      def keep: "labeled","unlabeled","assigned","unassigned","closed","reopened",
+                "referenced","cross-referenced","merged","milestoned","demilestoned",
+                "renamed","transferred","pinned","unpinned","locked","unlocked",
+                "marked_as_duplicate","unmarked_as_duplicate","comment_deleted",
+                "review_requested","review_request_removed","review_dismissed",
+                "ready_for_review","convert_to_draft","head_ref_force_pushed",
+                "head_ref_deleted","committed","base_ref_changed",
+                "auto_merge_enabled","auto_merge_disabled";
+      def detail:
+        if .event == "labeled" or .event == "unlabeled" then "`\(.label.name)`"
+        elif .event == "assigned" or .event == "unassigned" then "@\(.assignee.login)"
+        elif .event == "closed" or .event == "referenced" then
+          (if .commit_id then "commit \(.commit_id[0:7])" else "" end)
+        elif .event == "cross-referenced" then "\(.source.issue.html_url) — \(.source.issue.title)"
+        elif .event == "milestoned" or .event == "demilestoned" then (.milestone.title // "")
+        elif .event == "renamed" then "\(.rename.from) → \(.rename.to)"
+        elif .event == "marked_as_duplicate" then "of \(.duplicate.html_url // "?")"
+        elif .event == "comment_deleted" then "content is not recoverable from the API"
+        elif .event == "review_requested" then "@\(.requested_reviewer.login // "?")"
+        elif .event == "head_ref_force_pushed" then
+          (if .before and .after then "`\(.before[0:7])` → `\(.after[0:7])`" else "" end)
+        elif .event == "committed" then
+          (if .commit_id then "commit \(.commit_id[0:7])" else "" end)
+        elif .event == "base_ref_changed" then "\(.before // "?") → \(.after // "?")"
+        else "" end;
+      [ .[] | select(.event as $e | keep | index($e)) ] | to_entries[] |
+      ( .value | detail ) as $d |
+      "\n---\n\n## H\(.key + 1) · \(.value.event) · @\(.value.actor.login // .value.user.login // "?") · \(.value.created_at)\n\n" +
+      (if $d == "" then "" else "\($d)\n" end)
+    ' "$hist"
+  fi
+  if [ -s "$links" ]; then
+    jq -rs 'to_entries[] |
+      "\n---\n\n## X\(.key + 1) · @\(.value.actor.login // "?") · \(.value.created_at)\n\n" +
+      "\(.value.source.issue.html_url) — \(.value.source.issue.title)\n"' "$links"
+  fi
+} >"$out"
+
+printf 'file:      %s\n' "$out"
+printf 'size:      %s lines, %s\n' "$(wc -l <"$out" | tr -d ' ')" "$(du -h "$out" | cut -f1)"
+printf 'streams:   %s conversation / %s reported, %s reviews, %s inline, %s history\n' \
+  "$(wc -l <"$conv" | tr -d ' ')" "$(jq -r '.comments' "$tmp/issue.json")" \
+  "$(wc -l <"$revs" | tr -d ' ')" "$(wc -l <"$inl" | tr -d ' ')" \
+  "$(wc -l <"$hist" | tr -d ' ')"
+printf 'requests:  %s (%s not modified)\n' "$req" "$cached"
+printf 'api left:  %s req (this hour)\n' "$remaining"
+[ -z "$token" ] && printf 'note:      unauthenticated — 60 req/hr, public repos only\n'
+exit 0

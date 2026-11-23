@@ -1,0 +1,13 @@
+# Editors / OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local backups (deploy.sh --force creates these outside the repo, but be safe)
+*.bak
+*.bak.*
+
+# Dependencies, if a skill ever ships one
+node_modules/
+.envs/
