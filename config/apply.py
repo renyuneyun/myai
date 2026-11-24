@@ -142,11 +142,19 @@ def insert_top_level(text, key, value):
     if j < 0:
         raise ValueError("empty configuration document")
 
-    separator = "\n" if head[j] in "{," else ",\n"
+    # Keep the whitespace that preceded the closing brace, but attach the
+    # comma to the last value rather than leaving it on its own line.
+    prefix = head[:j + 1]
+    gap = head[j + 1:]
     literal = json.dumps(value, ensure_ascii=False, indent=2)
     literal = literal.replace("\n", "\n  ")
-    block = '%s  "%s": %s\n' % (separator, key, literal)
-    return head + block + tail
+    block = '  "%s": %s\n' % (key, literal)
+    if head[j] in "{,":
+        # Put the new key on its own line even in a compact `{}` or `{"a": 1,}`.
+        block = (gap if "\n" in gap else "\n") + block
+    else:
+        block = ",\n" + block
+    return prefix + block + tail
 
 
 def config_path(explicit):

@@ -1,10 +1,14 @@
 #!/usr/bin/env sh
-# myai deploy: link first-party skills and global instructions into the config
-# dirs of installed agents.
+# myai deploy: link first-party skills into the config dirs of installed agents,
+# and apply the portable tool config fragments.
 #
 # Design rules:
 #   * Only directories under skills/ are deployed. Third-party skills stay
 #     wherever their own installer put them and are never touched.
+#   * Global instruction files (AGENTS.md, CLAUDE.md, ...) are never written:
+#     they belong to the agent's owner, not to this repository.
+#   * Config fragments are merged by config/apply.py, which preserves unrelated
+#     keys and backs the real config up before writing.
 #   * A tool is skipped unless its config directory already exists.
 #   * Existing real files, real directories, and foreign symlinks are never
 #     overwritten unless --force is given; then they are backed up first.
@@ -27,13 +31,15 @@ usage() {
 Usage: $(basename -- "$0") [options]
 
 Link each skill under skills/ into the skill directory of every installed
-agent, and link instructions/AGENTS.md to each agent's global instruction
-file. Tools whose config directory is missing are skipped by default.
+agent, and merge config/opencode/worktree.jsonc into the global OpenCode
+config. Tools whose config directory is missing are skipped by default.
+Global instruction files are never modified.
 
 Options:
   -n, --dry-run      Show what would change; change nothing.
   -f, --force        Back up a conflicting entry to <name>.bak.<timestamp>,
-                     then create the link.
+                     then create the link; also allows config/apply.py to
+                     replace a different value or rewrite a commented JSONC.
   -c, --create       Create a tool's config directory if the tool is missing.
   -t, --tool NAME    Deploy only to this tool (opencode, claude).
                      Repeatable, or comma-separated.
@@ -206,35 +212,38 @@ deploy_tool() {
 	done
 }
 
-deploy_instruction() {
-	tool=$1
-	src="$repo_dir/instructions/AGENTS.md"
-	[ -f "$src" ] || return 0
+deploy_config() {
+	apply="$repo_dir/config/apply.py"
+	[ -f "$apply" ] || return 0
 
-	root=$(tool_root "$tool") || return 0
-	if [ ! -d "$root" ]; then
-		if [ "$create" -eq 1 ]; then
-			[ "$dry_run" -eq 1 ] || mkdir -p -- "$root"
-			printf 'create %s\n' "$root"
-		else
-			printf 'skip %s instructions: %s not found\n' "$tool" "$root"
-			return 0
-		fi
+	if ! command -v python3 >/dev/null 2>&1; then
+		printf 'skip opencode config: python3 not found\n'
+		skipped=$((skipped + 1))
+		return 0
 	fi
 
-	case "$tool" in
-		opencode) dest="$root/AGENTS.md" ;;
-		claude)   dest="$root/CLAUDE.md" ;;
-	esac
+	printf '== opencode config -> %s\n' \
+		"${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 
-	printf '== %s instructions -> %s\n' "$tool" "$dest"
-	link_entry "$src" "$dest" "instructions"
+	if [ "$dry_run" -eq 1 ]; then set -- --dry-run; else set --; fi
+	if [ "$force" -eq 1 ]; then set -- "$@" --force; fi
+	if [ "$create" -eq 1 ]; then set -- "$@" --create; fi
+
+	status=0
+	python3 "$apply" "$@" || status=$?
+	case "$status" in
+		0) ;;
+		1) conflicts=$((conflicts + 1)) ;;
+		*) die "config/apply.py failed (exit $status)" ;;
+	esac
 }
 
 for tool in opencode claude; do
 	if tool_selected "$tool"; then
 		deploy_tool "$tool"
-		deploy_instruction "$tool"
+		if [ "$tool" = opencode ]; then
+			deploy_config
+		fi
 	fi
 done
 

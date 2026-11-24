@@ -17,14 +17,14 @@ or machine-specific absolute paths.
 myai/
 ├── README.md          # this file
 ├── THIRD-PARTY.md     # index of upstream skills, never their content
-├── deploy.sh          # link skills/ and instructions/ into installed agents
+├── deploy.sh          # link skills/ into installed agents, apply config
 ├── .gitignore
 ├── config/
 │   ├── apply.py       # merge repo config fragments into global tool config
 │   └── opencode/
 │       └── worktree.jsonc
 ├── instructions/
-│   └── AGENTS.md      # global agent instructions (currently worktrees)
+│   └── AGENTS.md      # reference snippet; not deployed
 └── skills/            # first-party skills only, one directory each
     ├── env-isolation/
     ├── github-issues/
@@ -47,20 +47,25 @@ becomes first-party, with the origin recorded in its `SKILL.md`.
 ## Deploy
 
 `deploy.sh` symlinks each first-party skill into the skill directory of every
-**installed** agent, and links the shared global instruction file:
+**installed** agent, then merges the OpenCode config fragment:
 
-| Tool | Skills target | Global instruction target |
-|------|---------------|---------------------------|
-| OpenCode | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/` | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/AGENTS.md` |
-| Claude Code | `$HOME/.claude/skills/` | `$HOME/.claude/CLAUDE.md` |
+| Tool | Skills target | Config target |
+|------|---------------|---------------|
+| OpenCode | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/` | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json(c)` |
+| Claude Code | `$HOME/.claude/skills/` | — |
 
-Both are created only when the tool's config directory already exists.
+Skill directories and config files are created only when the tool's config
+directory already exists.
+
+Global instruction files (`AGENTS.md`, `CLAUDE.md`, ...) are deliberately never
+written: they belong to the agent's owner and may hold unrelated instructions.
+Use the agent's own mechanism, or a project-level instruction file, for that.
 
 ```sh
 ./deploy.sh --dry-run   # show actions, change nothing
 ./deploy.sh             # apply
 ./deploy.sh --tool opencode
-./deploy.sh --force     # back up conflicting entries, then link
+./deploy.sh --force     # back up conflicts and allow config replacement
 ./deploy.sh --create    # also create config dirs for tools not installed
 ```
 
@@ -71,22 +76,22 @@ Behaviour:
 - A real directory or foreign link in the way is reported and skipped. With
   `--force` it is renamed to `<name>.bak.<timestamp>` first, never deleted.
 - Third-party skill directories are never touched.
-- Global instruction files use the same link and conflict rules as skills.
+- Skill links and the config merge use the same link and conflict rules;
+  unresolved conflicts exit non-zero.
 
 ### First-time adoption
 
 If a tool directory already contains a real copy of a skill that now lives
-here, or its own `AGENTS.md`/`CLAUDE.md`, deploys will report a conflict. Move
-that copy aside yourself (or adopt its contents into
-`instructions/AGENTS.md`), then re-run `./deploy.sh` — or use `--force` to let
-the script back it up.
+here, deploys will report a conflict. Move that copy aside yourself, then
+re-run `./deploy.sh` — or use `--force` to let the script back it up.
 
 ## Portable tool settings
 
 `config/` holds secret-free fragments of tool configuration. The real global
 config is never committed: it contains provider credentials. Instead,
 `config/apply.py` merges one fragment key into it, preserving everything else
-and backing the file up first.
+and backing the file up first. `deploy.sh` runs it automatically for OpenCode;
+invoke it directly only for a one-off run or a custom config path.
 
 The current fragment, `config/opencode/worktree.jsonc`, sets OpenCode's
 `worktree.directory` to `.worktrees`. `apply.py` uses only the Python 3
@@ -112,10 +117,12 @@ Behaviour:
   each project's canonical checkout, so every project gets its own
   `.worktrees/`.
 
-`instructions/AGENTS.md` is the other half: the config controls OpenCode's
-native worktree tool, while the instruction tells agents using manual
-`git worktree` (and Claude Code) the same convention. This repository's own
-`.gitignore` ignores `.worktrees/`.
+The same convention applies when agents create worktrees manually (or in tools
+without a native worktree setting, such as Claude Code):
+[`instructions/AGENTS.md`](instructions/AGENTS.md) is the canonical text for it.
+That file is not deployed by `deploy.sh`; copy what you need into a project's
+own `AGENTS.md`/`CLAUDE.md`, or into your own global instruction file. This
+repository's own `.gitignore` ignores `.worktrees/`.
 
 ## Add a first-party skill
 
@@ -144,12 +151,13 @@ its own mechanism (cc-switch, the upstream repo, a plugin marketplace, etc.).
 Deployment only changes agent config directories. After running it:
 
 ```sh
-ls -l ~/.config/opencode/skills ~/.claude/skills \
-      ~/.config/opencode/AGENTS.md ~/.claude/CLAUDE.md
+ls -l ~/.config/opencode/skills ~/.claude/skills
 readlink -f ~/.config/opencode/skills/<name>
+grep -A2 '"worktree"' ~/.config/opencode/opencode.jsonc
 ```
 
-Then start the agent and confirm the skill appears.
+Then start the agent and confirm the skill appears and new worktrees land in
+`.worktrees/`.
 
 ## License
 

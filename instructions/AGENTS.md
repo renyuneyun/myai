@@ -1,13 +1,10 @@
-# Global agent instructions
+# Global agent instructions (reference)
 
-This file is the canonical set of global instructions for every agent on this
-machine. `deploy.sh` links it to:
-
-- `~/.config/opencode/AGENTS.md` (OpenCode)
-- `~/.claude/CLAUDE.md` (Claude Code)
-
-Project-level instruction files still take precedence where they exist. Edit
-this file here, not the deployed symlinks.
+This file is a canonical, copy-pasteable set of global instructions. It is
+**not** deployed by `deploy.sh` and is never linked into an agent's config
+directory: global instruction files belong to their owner, who may keep other
+rules in them. Copy the sections you want into a project's `AGENTS.md` /
+`CLAUDE.md`, or into your own global instruction file, and edit them there.
 
 ## Worktrees
 
