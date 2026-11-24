@@ -17,8 +17,14 @@ or machine-specific absolute paths.
 myai/
 ├── README.md          # this file
 ├── THIRD-PARTY.md     # index of upstream skills, never their content
-├── deploy.sh          # link skills/ into installed agents
+├── deploy.sh          # link skills/ and instructions/ into installed agents
 ├── .gitignore
+├── config/
+│   ├── apply.py       # merge repo config fragments into global tool config
+│   └── opencode/
+│       └── worktree.jsonc
+├── instructions/
+│   └── AGENTS.md      # global agent instructions (currently worktrees)
 └── skills/            # first-party skills only, one directory each
     ├── env-isolation/
     ├── github-issues/
@@ -41,12 +47,14 @@ becomes first-party, with the origin recorded in its `SKILL.md`.
 ## Deploy
 
 `deploy.sh` symlinks each first-party skill into the skill directory of every
-**installed** agent:
+**installed** agent, and links the shared global instruction file:
 
-| Tool | Target | Created when |
-|------|--------|--------------|
-| OpenCode | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/` | the OpenCode config dir exists |
-| Claude Code | `$HOME/.claude/skills/` | `~/.claude` exists |
+| Tool | Skills target | Global instruction target |
+|------|---------------|---------------------------|
+| OpenCode | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills/` | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/AGENTS.md` |
+| Claude Code | `$HOME/.claude/skills/` | `$HOME/.claude/CLAUDE.md` |
+
+Both are created only when the tool's config directory already exists.
 
 ```sh
 ./deploy.sh --dry-run   # show actions, change nothing
@@ -63,12 +71,51 @@ Behaviour:
 - A real directory or foreign link in the way is reported and skipped. With
   `--force` it is renamed to `<name>.bak.<timestamp>` first, never deleted.
 - Third-party skill directories are never touched.
+- Global instruction files use the same link and conflict rules as skills.
 
 ### First-time adoption
 
 If a tool directory already contains a real copy of a skill that now lives
-here, deploys will report a conflict. Move that copy aside yourself, then
-re-run `./deploy.sh` (or use `--force` to let the script back it up).
+here, or its own `AGENTS.md`/`CLAUDE.md`, deploys will report a conflict. Move
+that copy aside yourself (or adopt its contents into
+`instructions/AGENTS.md`), then re-run `./deploy.sh` — or use `--force` to let
+the script back it up.
+
+## Portable tool settings
+
+`config/` holds secret-free fragments of tool configuration. The real global
+config is never committed: it contains provider credentials. Instead,
+`config/apply.py` merges one fragment key into it, preserving everything else
+and backing the file up first.
+
+The current fragment, `config/opencode/worktree.jsonc`, sets OpenCode's
+`worktree.directory` to `.worktrees`. `apply.py` uses only the Python 3
+standard library.
+
+```sh
+./config/apply.py --dry-run   # show the change
+./config/apply.py             # apply
+./config/apply.py --force     # replace a different value, or rewrite a
+                              # commented JSONC file (comments are lost)
+./config/apply.py --config /path/to/opencode.jsonc
+```
+
+Behaviour:
+
+- Only the `worktree` key is added or replaced; providers, models, plugins,
+  MCP servers, and credentials are left alone.
+- If the file is missing, a minimal config with `$schema` is created (when the
+  OpenCode config directory exists, or with `--create`).
+- A JSONC file containing comments is not rewritten without `--force`, because
+  comments cannot survive a rewrite.
+- The value is valid globally and per project. Relative paths resolve against
+  each project's canonical checkout, so every project gets its own
+  `.worktrees/`.
+
+`instructions/AGENTS.md` is the other half: the config controls OpenCode's
+native worktree tool, while the instruction tells agents using manual
+`git worktree` (and Claude Code) the same convention. This repository's own
+`.gitignore` ignores `.worktrees/`.
 
 ## Add a first-party skill
 
@@ -97,7 +144,8 @@ its own mechanism (cc-switch, the upstream repo, a plugin marketplace, etc.).
 Deployment only changes agent config directories. After running it:
 
 ```sh
-ls -l ~/.config/opencode/skills ~/.claude/skills
+ls -l ~/.config/opencode/skills ~/.claude/skills \
+      ~/.config/opencode/AGENTS.md ~/.claude/CLAUDE.md
 readlink -f ~/.config/opencode/skills/<name>
 ```
 

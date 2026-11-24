@@ -11,3 +11,8 @@
 # Dependencies, if a skill ever ships one
 node_modules/
 .envs/
+__pycache__/
+*.pyc
+
+# Worktrees created in this repository
+.worktrees/

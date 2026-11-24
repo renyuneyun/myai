@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# myai deploy: link first-party skills into the config dirs of installed agents.
+# myai deploy: link first-party skills and global instructions into the config
+# dirs of installed agents.
 #
 # Design rules:
 #   * Only directories under skills/ are deployed. Third-party skills stay
@@ -26,7 +27,8 @@ usage() {
 Usage: $(basename -- "$0") [options]
 
 Link each skill under skills/ into the skill directory of every installed
-agent. Tools whose config directory is missing are skipped by default.
+agent, and link instructions/AGENTS.md to each agent's global instruction
+file. Tools whose config directory is missing are skipped by default.
 
 Options:
   -n, --dry-run      Show what would change; change nothing.
@@ -124,6 +126,50 @@ handle_conflict() {
 	linked=$((linked + 1))
 }
 
+link_entry() {
+	src=$1
+	dest=$2
+	label=$3
+
+	if [ -L "$dest" ]; then
+		target=$(readlink -- "$dest" || true)
+		if [ "$target" = "$src" ]; then
+			printf 'ok   %s (already linked)\n' "$label"
+			skipped=$((skipped + 1))
+			return 0
+		fi
+		case "$target" in
+			"$repo_dir"/*)
+				# A link into this repo that has gone stale (renamed or
+				# removed entry). Ours to repair.
+				if [ "$dry_run" -eq 1 ]; then
+					printf '  would relink %s -> %s\n' "$dest" "$src"
+				else
+					ln -sfn -- "$src" "$dest"
+					printf 'link %s (relinked)\n' "$label"
+				fi
+				linked=$((linked + 1))
+				return 0
+				;;
+		esac
+		handle_conflict "$dest" "$src"
+		return 0
+	fi
+
+	if [ -e "$dest" ]; then
+		handle_conflict "$dest" "$src"
+		return 0
+	fi
+
+	if [ "$dry_run" -eq 1 ]; then
+		printf '  would link %s -> %s\n' "$dest" "$src"
+	else
+		ln -s -- "$src" "$dest"
+		printf 'link %s\n' "$label"
+	fi
+	linked=$((linked + 1))
+}
+
 deploy_tool() {
 	tool=$1
 	root=$(tool_root "$tool") || return 0
@@ -156,51 +202,39 @@ deploy_tool() {
 			continue
 		fi
 
-		dest="$dest_dir/$name"
-
-		if [ -L "$dest" ]; then
-			target=$(readlink -- "$dest" || true)
-			if [ "$target" = "$src" ]; then
-				printf 'ok   %s (already linked)\n' "$name"
-				skipped=$((skipped + 1))
-				continue
-			fi
-			case "$target" in
-				"$skills_dir"/*)
-					# A link into this repo that has gone stale (renamed or
-					# removed skill). Ours to repair.
-					if [ "$dry_run" -eq 1 ]; then
-						printf '  would relink %s -> %s\n' "$dest" "$src"
-					else
-						ln -sfn -- "$src" "$dest"
-						printf 'link %s (relinked)\n' "$name"
-					fi
-					linked=$((linked + 1))
-					continue
-					;;
-			esac
-			handle_conflict "$dest" "$src"
-			continue
-		fi
-
-		if [ -e "$dest" ]; then
-			handle_conflict "$dest" "$src"
-			continue
-		fi
-
-		if [ "$dry_run" -eq 1 ]; then
-			printf '  would link %s -> %s\n' "$dest" "$src"
-		else
-			ln -s -- "$src" "$dest"
-			printf 'link %s\n' "$name"
-		fi
-		linked=$((linked + 1))
+		link_entry "$src" "$dest_dir/$name" "$name"
 	done
+}
+
+deploy_instruction() {
+	tool=$1
+	src="$repo_dir/instructions/AGENTS.md"
+	[ -f "$src" ] || return 0
+
+	root=$(tool_root "$tool") || return 0
+	if [ ! -d "$root" ]; then
+		if [ "$create" -eq 1 ]; then
+			[ "$dry_run" -eq 1 ] || mkdir -p -- "$root"
+			printf 'create %s\n' "$root"
+		else
+			printf 'skip %s instructions: %s not found\n' "$tool" "$root"
+			return 0
+		fi
+	fi
+
+	case "$tool" in
+		opencode) dest="$root/AGENTS.md" ;;
+		claude)   dest="$root/CLAUDE.md" ;;
+	esac
+
+	printf '== %s instructions -> %s\n' "$tool" "$dest"
+	link_entry "$src" "$dest" "instructions"
 }
 
 for tool in opencode claude; do
 	if tool_selected "$tool"; then
 		deploy_tool "$tool"
+		deploy_instruction "$tool"
 	fi
 done
 
@@ -210,7 +244,7 @@ else
 	printf '\n%s: %s linked, %s already ok/skipped' "$app" "$linked" "$skipped"
 fi
 if [ "$conflicts" -gt 0 ]; then
-	printf ', %s unresolved conflict(s)\n' "$conflicts" >&2
+	printf '\n%s: %s unresolved conflict(s)\n' "$app" "$conflicts" >&2
 	printf 'Handle the conflicts manually, or re-run with --force to back them up.\n' >&2
 	exit 1
 fi
